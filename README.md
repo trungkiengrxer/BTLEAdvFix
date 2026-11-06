@@ -2,7 +2,10 @@
 
 Experimental Lilu plugin that restores Bluetooth LE advertising on Hackintoshes with non-Apple Broadcom Bluetooth controllers such as the BCM20702 in the Dell DW1560, under macOS Tahoe.
 
-With BLE advertising working again, the Mac can wake nearby devices, so **AirDrop from the Mac to older iPhones (iOS 15)** works again.
+It fixes two problems in `bluetoothd`, and both have to be fixed for **AirDrop from the Mac to older iPhones (iOS 15)** to work reliably:
+
+1. BLE advertising never starts at all.
+2. Once advertising works, the AirDrop advertisement is usually dropped in favour of other Continuity advertisements, because the controller has only one 31-byte advertising slot.
 
 ## Tested hardware and software
 
@@ -14,18 +17,19 @@ With BLE advertising working again, the Mac can wake nearby devices, so **AirDro
 - Lilu 1.7.2
 - BrcmPatchRAM3 / BrcmFirmwareStore / BlueToolFixup 2.7.2
 - AirportBrcmFixup 2.2.0
+- Receiving device: iPhone 7 Plus (`iPhone9,2`), iOS 15.8.3
 
 ## Problem
 
 AirDrop works in only one direction:
 
-| Direction | Before |
-|-----------|--------|
+| Direction | Without BTLEAdvFix |
+|-----------|--------------------|
 | iPhone (any iOS) -> Hackintosh | Works |
 | Hackintosh -> iPhone on iOS 26 | Works |
 | Hackintosh -> another Mac | Works |
 | **Hackintosh -> iPhone on iOS 15** | **Fails** |
-| **Instant Hotspot from the Hackintosh** | **Fails** |
+| **Instant Hotspot from the Hackintosh** | **Fails** (separate cause, see [Known limitations](#known-limitations)) |
 
 When sending to the iOS 15 iPhone:
 
@@ -34,26 +38,30 @@ When sending to the iOS 15 iPhone:
 - the iPhone never reacts (no prompt, no notification)
 - a real Mac on the same macOS version can AirDrop to the same iPhone without problems
 
-This has been reported for DW1560/BCM20702 cards since macOS Monterey, for example in [acidanthera/bugtracker#1821](https://github.com/acidanthera/bugtracker/issues/1821).
-
-## Root cause
-
-The Mac never sends any Bluetooth LE advertisement. It can scan (that is why it still sees iPhones and can *receive* AirDrop), but it cannot advertise.
-
-Sending AirDrop to an older iPhone requires the Mac to broadcast a BLE "AirDrop" advertisement (Apple manufacturer data `4C 00 05 12 ...`). That advertisement wakes the iPhone, which then brings up AWDL and publishes its `_airdrop._tcp` Bonjour service. Without it, the Mac waits for Bonjour, times out and fails:
-
 ```text
-sharingd  [AirDropNW.Discovery] Bonjour discovery timed out for (<private>)
-sharingd  [AirDrop.XXXXXXXX]    Send StateMachine FAILED {error: Error Domain=Sharing.SFAirDropSend.Failure Code=1}
+sharingd  [AirDropNW.Discovery] Connectable (Device(... Nm "iPhone", Md iPhone9,2)) requires Bonjour discovery
+sharingd  [AirDropNW.Discovery] Bonjour discovery timed out for (Device(... Nm "iPhone", Md iPhone9,2))
+sharingd  [AirDrop.XXXXXXXX]    Send StateMachine FAILED {error: Sharing.SFAirDropSend.Failure.resolveFailure(bonjour: false)}
 ```
 
-Instant Hotspot fails for the same reason.
+The one-way AirDrop issue on DW1560/BCM20702 cards has been reported since macOS Monterey, for example in [acidanthera/bugtracker#1821](https://github.com/acidanthera/bugtracker/issues/1821).
 
-### Why advertising never starts
+## How AirDrop to an older iPhone works
+
+An iOS 15 iPhone does not keep its AirDrop service published. To send to it, the Mac broadcasts a BLE "AirDrop" advertisement (Apple manufacturer data `4C 00 05 12 ...`). The iPhone sees it and wakes up AWDL (Apple Wireless Direct Link). It then publishes a fresh `_airdrop._tcp` Bonjour service, which the Mac resolves and connects to.
+
+Notes from the iPhone's own logs:
+
+- iOS 15 scans for AirDrop advertisements only while the screen is on (`screen off: No Scan`), and ignores advertisements weaker than −80 dBm.
+- Its AirDrop server shuts down after an idle timeout and comes back only when it is woken again.
+
+If the Mac's AirDrop advertisement never reaches the air, the iPhone never wakes up and the send times out.
+
+## Root cause, part 1: advertising never starts
 
 The chain below was traced in the x86_64 slice of `/usr/sbin/bluetoothd` from macOS 26.6 (25G72).
 
-1. **`bluetoothd` selects "multiple advertising" mode.** The `LeBroadcaster` constructor reads a per-platform LE hardware model. That model reports `SupportsMultipleAdvertising = 1` for this platform. It does not check whether the real controller supports it. bluetoothd therefore skips the `Using a single advertising instance` branch and keeps advertising mode `0`:
+1. **`bluetoothd` selects "multiple advertising" mode.** The `LeBroadcaster` constructor reads a per-platform LE hardware model. That model reports `SupportsMultipleAdvertising = 1` for this platform, without checking whether the real controller supports it:
 
    ```text
    0x100696a90  cmpb $0x0, 0xa0(%rax)    ; SupportsMultipleAdvertising
@@ -62,69 +70,85 @@ The chain below was traced in the x86_64 slice of `/usr/sbin/bluetoothd` from ma
    0x100696ad9  movl $0x1, 0x90(%rbx)    ; advertising mode = single instance
    ```
 
-2. **`LeBroadcaster::stackDidStart()` calls `LE_InitMultipleAdvertising`.** In multi-advertising mode the stack sends a Broadcom vendor-specific (VSC) multi-advertising command.
+2. **`LeBroadcaster::stackDidStart()` calls `LE_InitMultipleAdvertising`**, which sends a Broadcom vendor-specific (VSC) multi-advertising command.
+3. **The BCM20702 rejects that vendor command** (`[Stack.VSC] status STATUS 701`, then `_initMultipleAdvertisingLocalCB`).
+4. **The failure is swallowed silently.** The completion handler returns early on a non-zero status without logging. It never runs `movb $0x1, 0x31(%rbx)`, the flag that marks the advertising stack as started.
+5. **Every advertisement is then dropped.** On the tested machine, `Stack is not started, updateAdvertisement returning` was logged 689 times in 6 hours, and the advertising state never left `Idle(0) --> Idle(0) stack:OFF`.
 
-3. **The BCM20702 rejects that vendor command.** The BCM20702 dates from 2010 and does not implement it:
+In single-instance mode, `stackDidStart()` takes a legacy initialization path that completes with status `0`, and standard Bluetooth 4.0 LE advertising works.
 
-   ```text
-   bluetoothd  [Stack.VSC] status  STATUS 701
-   bluetoothd  [Stack.LE]   _initMultipleAdvertisingLocalCB
-   ```
+## Root cause, part 2: the AirDrop advertisement loses the only slot
 
-4. **The failure is swallowed silently.** The completion callback forwards status `701` to `LeBroadcaster`. That handler returns early on a non-zero status, without logging. It therefore never runs `movb $0x1, 0x31(%rbx)`, the flag that marks the advertising stack as started.
+With part 1 fixed, the Mac advertises again, but AirDrop to iOS 15 works only now and then. An HCI trace (see [Debugging](#debugging-with-an-hci-trace)) shows why.
 
-5. **Every advertisement is then dropped.** `LeBroadcaster::updateAdvertisement` checks that flag first:
+bluetoothd keeps two advertising sessions:
 
-   ```text
-   bluetoothd  [Server.LE.Advertise] Advertising state change:  Idle(0) --> Idle(0) stack:OFF
-   bluetoothd  [Server.LE.Advertise] Stack is not ready, waiting for the stack to start
-   bluetoothd  [Server.LE.Advertise] Stack is not started, updateAdvertisement returning
-   ```
+| Session | Content | Raw AD size |
+|---------|---------|-------------|
+| `CBStackAdvertiserCA` (connectable) | AirPlay Target (`09`), NearbyInfo (`10`), Handoff (`0C`) | about 21 bytes |
+| `CBStackAdvertiserNC` (non-connectable) | **AirDrop (`05`)** | 24 bytes |
 
-   On the tested machine this was logged 689 times in 6 hours, and the advertising state never left `Idle ... stack:OFF`.
+On a real Mac, each session gets its own advertising set. The BCM20702 has one 31-byte legacy set, and after Flags (3 bytes) and TX Power (3 bytes) only about 25 bytes are left, so the two sessions never fit together.
 
-If the advertising mode is `1` (single instance), `stackDidStart()` uses the legacy initialization path instead. That path completes with status `0`, so the stack flag is set and standard Bluetooth 4.0 LE advertising works.
+In single-instance mode, the advertisement builder (`0x1006a1378`) copies each session's raw advertising data into the slot **first-fit, in session-vector order** (copy loops at `0x1006a436e` and `0x1006a4411`). Whichever session comes first wins. NearbyInfo is refreshed every few seconds, so the connectable session is usually first and the AirDrop advertisement is dropped.
+
+Traced payloads sent to the controller (`LE_SetAdvData`), with BTLEAdvFix 0.1.0:
+
+| Requested types (bluetoothd log) | Bytes actually sent to the controller |
+|----------------------------------|---------------------------------------|
+| `[ 5 9 ]` right after the AirDrop session restarted | `Flags, TxPower, Apple{05}`: AirDrop on air |
+| `[ 5 9 16 ]` most of the time | `Flags, TxPower, Apple{09 10}`: **AirDrop dropped** |
+
+This is why AirDrop worked right after toggling Bluetooth or restarting `sharingd`, and then stopped working again within minutes. Changing the BLE address rotation interval does not help.
 
 ## How it works
 
-BTLEAdvFix is a Lilu plugin.
+BTLEAdvFix is a Lilu plugin. It routes `_cs_validate_page`, and whenever a code page of `/usr/sbin/bluetoothd` is mapped, it applies four verified byte patches to that page.
 
-It routes `_cs_validate_page`. When a code page of `/usr/sbin/bluetoothd` is mapped, it looks for one verified 12-byte pattern in the `LeBroadcaster` constructor and replaces the `jne` with two `nop`s:
+| # | Location | Change |
+|---|----------|--------|
+| 1 | `0x100696a97` (LeBroadcaster constructor) | `jne` -> `nop nop`: always use a single advertising instance (fixes part 1) |
+| 2 | `0x100aa23b0` (zero padding after `__eh_frame`, end of `__TEXT`) | 116-byte routine that moves the AirDrop session to the front of the session vector ([`docs/cave.s`](docs/cave.s)) |
+| 3 | `0x1006a4351` (advertisement builder) | the two 7-byte loads of the session vector begin/end are replaced by `call 0x100aa23b0` + 9 `nop`; the routine performs both loads before returning |
+| 4 | `0x1006a3ce3` (advertisement builder) | `je 0x1006a4358` -> `je 0x1006a4351`. This branch jumped into the second replaced load. On that path `rax` already holds the vector end, so entering at the call is equivalent, and the routine runs there too |
 
-```text
-Original:     80 B8 A0 00 00 00 00 75 4A 48 8D 05
-Replacement:  80 B8 A0 00 00 00 00 90 90 48 8D 05
-```
+The routine identifies the AirDrop session by its raw data, `?? FF 4C 00 05` (an Apple manufacturer AD whose first type is AirDrop), so it does not depend on internal session flags. When no AirDrop advertisement is active, the order is unchanged and everything behaves exactly as with patch 1 alone.
 
-As a result, bluetoothd always takes the "single advertising instance" branch. It never sends the unsupported multi-advertising command, and the advertising stack starts normally.
+The result matches what a real Mac does with separate advertising sets: while AirDrop is active, the slot carries the AirDrop advertisement; otherwise it carries AirPlay, NearbyInfo and Handoff as before.
 
-- The pattern occurs exactly once in the whole `bluetoothd` file (both slices) of build 25G72.
-- If the pattern is not found, nothing is patched.
+Safety properties:
+
+- Every pattern occurs exactly once in `bluetoothd` 25G72. If a pattern is not found, nothing is patched.
+- There are no one-shot flags. Patches 2, 3 and 4 depend on each other, so every page-in of `bluetoothd` is patched again, and pages that are already patched no longer match.
 - The System volume and `bluetoothd` on disk are not modified.
 - The plugin only loads on macOS Tahoe (Darwin 25).
 
 ## Result
 
-After installing BTLEAdvFix on the tested machine:
+HCI trace and logs with BTLEAdvFix 0.2.1 on the tested machine. The two sends were 11 minutes after boot, the window in which 0.1.0 used to fail.
 
-```text
-bluetoothd  [Server.LE.Advertise] Using a single advertising instance
-bluetoothd  [Server.LE.Advertise] Advertising state change:  Idle(0) --> Starting(1) stack:ON
-bluetoothd  [Server.LE.Advertise] Advertising state change:  Starting(1) --> Advertising(2) stack:ON
-bluetoothd  [CBAdvertiserDaemon]  AirDrop advertise WP start: <...>, rate 30.00 ms
-sharingd    [AirDrop.XXXXXXXX]    Send StateMachine UPLOAD END
-sharingd    [AirDrop.XXXXXXXX]    Send StateMachine END
-```
+| | Send 1 | Send 2 |
+|---|---|---|
+| bluetoothd starts the AirDrop advertisement | 02:40:55.630 | 02:48:18.272 |
+| controller receives `Flags, TxPower, Apple{05}` | 02:40:55.638 | 02:48:18.280 |
+| iPhone appears on AWDL with a **fresh** `_airdrop._tcp` name | 02:40:56.904 | 02:48:18.808 |
+| send result | **completed** in 1.4 s | **completed** in 1.8 s |
+| AirDrop advertisement stops, slot goes back to AirPlay/NearbyInfo | 02:41:10 | 02:48:24 |
 
-- `Stack is not started` no longer appears.
-- AirDrop from the Hackintosh to the iOS 15 iPhone completes in about 2 seconds and the file is received.
+The fresh Bonjour service name about one second after the advertisement shows that the Mac's advertisement is what woke the iPhone.
 
 ## Installation
 
 1. Download `BTLEAdvFix-<version>-RELEASE.zip` from the latest release and extract `BTLEAdvFix.kext`.
-2. Copy it to `EFI/OC/Kexts`.
+2. Copy it to `EFI/OC/Kexts`, replacing any older version. Delete the old folder first; a Finder merge can leave the old binary in place.
 3. Add it to `Kernel -> Add` after `Lilu.kext`. Keep your existing Bluetooth kexts.
 4. Reboot.
+
+```bash
+rm -rf /Volumes/EFI/EFI/OC/Kexts/BTLEAdvFix.kext
+ditto BTLEAdvFix.kext /Volumes/EFI/EFI/OC/Kexts/BTLEAdvFix.kext
+plutil -extract CFBundleVersion raw /Volumes/EFI/EFI/OC/Kexts/BTLEAdvFix.kext/Contents/Info.plist
+```
 
 Recommended load order:
 
@@ -136,7 +160,7 @@ BrcmPatchRAM3.kext
 BTLEAdvFix.kext
 ```
 
-BTLEAdvFix does not replace BrcmPatchRAM or BlueToolFixup. You still need them to get basic Bluetooth working on the controller.
+BTLEAdvFix does not replace BrcmPatchRAM or BlueToolFixup. You still need them for basic Bluetooth.
 
 Boot arguments:
 
@@ -150,46 +174,69 @@ Boot arguments:
 
 Use `/usr/bin/log` with the full path. In zsh, plain `log` is a shell builtin and prints nothing useful.
 
-Check that the kext is loaded:
-
 ```bash
 kmutil showloaded | grep -iE 'Lilu|BTLEAdvFix'
 ```
 
-Check that bluetoothd now uses a single advertising instance and the stack is `ON`:
-
 ```bash
-/usr/bin/log show --last boot --style compact \
-  --predicate 'process == "bluetoothd" AND (eventMessage CONTAINS "single advertising" OR eventMessage CONTAINS "Stack is not started" OR eventMessage CONTAINS "Advertising state change")' \
+/usr/bin/log show --last boot --info --style compact \
+  --predicate 'process == "bluetoothd" AND (eventMessage CONTAINS "single advertising" OR eventMessage CONTAINS "Stack is not started" OR eventMessage CONTAINS "Advertising instance Apple Types")' \
   | tail -20
 ```
 
 What to look for:
 
-- **Patched:** `Using a single advertising instance`, then transitions such as `Starting(1) --> Advertising(2) stack:ON`.
-- **Not patched:** `Idle(0) --> Idle(0) stack:OFF`, followed by repeated `Stack is not started, updateAdvertisement returning`.
+- **Working:** `Using a single advertising instance`, then lines such as `[0] Starting Connectable Advertising instance Apple Types [ 9 16 ]`.
+- **Part 1 not patched:** repeated `Stack is not started, updateAdvertisement returning`.
+- **Something wrong with patches 2-4:** no `Apple Types` lines at all. Switch back to 0.1.0 or use `-bladvoff`, and open an issue with an HCI trace.
 
-Then send a file with AirDrop from the Mac to an older iPhone.
+Then send a file with AirDrop to an older iPhone with its screen on.
+
+## Debugging with an HCI trace
+
+The `Apple Types` list in the bluetoothd log is what was *requested*, not what the controller transmits. To see the real bytes, enable bluetoothd's built-in PacketLogger file tracing:
+
+```bash
+sudo mkdir -p /Library/Logs/Bluetooth
+sudo defaults write /Library/Preferences/com.apple.MobileBluetooth.debug HCITraces -dict HCIFileTraces -bool true
+notifyutil -p com.apple.bluetooth.prefsChanged
+```
+
+Toggling Bluetooth does not reload this setting; the notification (or restarting `bluetoothd`) does. The trace is written to `/var/root/Library/Logs/Bluetooth/bluetoothd-hci-latest.pklg`:
+
+```bash
+sudo cp /var/root/Library/Logs/Bluetooth/bluetoothd-hci-latest.pklg ~/Desktop/
+sudo chown $USER ~/Desktop/bluetoothd-hci-latest.pklg
+python3 tools/pklg_adv.py ~/Desktop/bluetoothd-hci-latest.pklg --utc-offset 0
+```
+
+`tools/pklg_adv.py` prints every advertising payload sent to the controller, decoded into AD structures and Apple continuity types (`05` AirDrop, `09` AirPlay Target, `0c` Handoff, `10` NearbyInfo, ...), plus `LE_CreateConn` commands and failed HCI commands. The timestamps in these traces are already local time, so pass `--utc-offset 0`.
+
+Turn tracing off when done:
+
+```bash
+sudo defaults delete /Library/Preferences/com.apple.MobileBluetooth.debug HCITraces
+```
 
 ## Porting to another macOS build
 
-The patch is tied to the exact bytes of `bluetoothd` in macOS 26.6 (25G72). After a macOS update, check whether the pattern still exists:
+The patches are tied to the exact bytes of `bluetoothd` in macOS 26.6 (25G72). After a macOS update, run:
 
 ```bash
-python3 -c 'd=open("/usr/sbin/bluetoothd","rb").read(); print(d.count(bytes.fromhex("80b8a000000000754a488d05")))'
+python3 tools/check_patterns.py
 ```
 
-If this prints `1`, the current release still applies. If it prints `0`, a new pattern is needed. To find it:
+It checks that:
 
-1. Disassemble the x86_64 slice:
+- every pattern matches exactly once;
+- the inserted call lands on the routine and the retargeted `je` lands on the call;
+- no branch anywhere in `__text` lands inside replaced bytes. That exact mistake broke an earlier 0.2.0 build: Apple data disappeared from every advertisement.
 
-   ```bash
-   otool -arch x86_64 -tV /usr/sbin/bluetoothd > bluetoothd.asm
-   ```
+If it fails, new patterns are needed:
 
-2. Find the reference to the string `Using a single advertising instance`.
-3. A few instructions above it, find the `cmpb $0x0, 0xa0(%rax)` / `jne` pair that skips that branch.
-4. Add an original/replacement pair to `BTLEAdvFix/kern_start.cpp` that turns that `jne` into `nop`s.
+1. `otool -arch x86_64 -tV /usr/sbin/bluetoothd > bluetoothd.asm`
+2. Patch 1: find the string `Using a single advertising instance`. A few instructions above it is the `cmpb $0x0, 0xa0(%rax)` / `jne` pair to `nop` out.
+3. Patches 2-4: in the advertisement builder, find the two loops that walk the session vector (`movq -0x6db8(%rbp)` / `movq -0x6dc0(%rbp)` before a loop calling the raw-data size/data accessors). Re-derive the vector and session-data offsets, rebuild [`docs/cave.s`](docs/cave.s), and re-check every branch into the replaced instructions.
 
 ## Building
 
@@ -206,8 +253,6 @@ Lilu.kext
 MacKernelSDK
 ```
 
-Build the Release configuration:
-
 ```bash
 xcodebuild \
   -project BTLEAdvFix.xcodeproj \
@@ -217,7 +262,11 @@ xcodebuild \
   build
 ```
 
-The kext and a release zip are written to `build/Release`.
+The kext and a release zip are written to `build/Release`. To rebuild the routine bytes:
+
+```bash
+clang -c -arch x86_64 docs/cave.s -o /tmp/cave.o && otool -t /tmp/cave.o
+```
 
 ## Compatibility
 
@@ -226,22 +275,29 @@ Currently verified only on:
 - Dell DW1560 / BCM20702A3 Bluetooth
 - macOS Tahoe 26.6 (25G72)
 - Intel x86_64
+- AirDrop receiver: iPhone on iOS 15.8.3
 
-Other BCM20702-based cards (DW1830, BCM94352Z, Fenvi with BCM20702) are likely affected by the same issue, but have not been tested. Cards with a native Apple Bluetooth module (for example BCM94360NG/CS2) do not need this plugin.
+Other BCM20702-based cards (DW1830, BCM94352Z, Fenvi with BCM20702) are likely affected by the same issues, but have not been tested. Cards with a native Apple Bluetooth module (for example BCM94360NG/CS2) do not need this plugin.
 
 ## Known limitations
 
-- **Single advertising instance only.** bluetoothd now rotates all of its advertisements (AirDrop, Handoff, Nearby, and others) through one advertising set, as Macs with older controllers do. Features that rely on several advertisements at the same time may behave differently.
-- **Instant Hotspot not yet confirmed.** It depends on the same BLE advertising and is expected to improve, but has not been verified yet.
-- **Other Continuity features are not fixed.** Many other Apple-specific vendor commands are still rejected by the BCM20702, for example `BD_VSC_LE_META_*` with status `701`. Features that depend on them may still fail.
+- **Instant Hotspot still fails.** This is a different problem. The Mac must open a BLE connection to the iPhone. bluetoothd adds the iPhone's *identity* address (`Public 98:10:...`) to the controller's filter accept list and expects the controller to resolve the iPhone's random private address (RPA). That needs Bluetooth 4.2 LL Privacy, or the Broadcom `ADD_IRK_TO_LIST` vendor command that Apple's own firmware implements. The DW1560 firmware has neither (the vendor command returns `701`), so `LE_CreateConn` never matches the iPhone. The first attempt is also rejected with `0x0C Command Disallowed` because the controller is scanning. Connections initiated by the iPhone do work (bluetoothd resolves the RPA in software), but Instant Hotspot needs the Mac to connect. Workaround: turn on Personal Hotspot on the iPhone and join it from the Mac's Wi-Fi menu.
+- **One advertisement at a time.** While AirDrop is active, AirPlay/NearbyInfo/Handoff advertisements are paused. This is a hardware limit of a single legacy advertising set.
+- **Other Continuity features are not fixed.** Other Apple vendor commands are still rejected by the BCM20702, for example `BD_VSC_LE_META_*` with status `701`.
 
 ## Safety warning
 
-This project patches executable code of a system daemon at runtime.
+This project patches executable code of a system daemon at runtime, including inserting a small routine.
 
-A mismatched macOS build or a changed byte pattern is ignored by design. Even so, any patch to `bluetoothd` can cause Bluetooth instability.
+A mismatched macOS build is ignored by design: patterns simply do not match. Even so, any patch to `bluetoothd` can cause Bluetooth instability.
 
-Keep a working EFI backup, and keep a reliable way to disable the plugin: the `-bladvoff` boot argument, or removing the kext.
+Keep a working EFI backup, and keep a reliable way to disable the plugin: the `-bladvoff` boot argument, removing the kext, or going back to 0.1.0.
+
+## Changelog
+
+- **0.2.1**: AirDrop-first routine (patches 2-4); AirDrop to iOS 15 now works reliably. `tools/check_patterns.py` checks branch targets; `tools/pklg_adv.py` decodes HCI traces.
+- **0.2.0** (not released): first AirDrop-first build. A branch into replaced bytes broke advertisement data.
+- **0.1.0**: single advertising instance (patch 1). BLE advertising works, but AirDrop to iOS 15 works only intermittently.
 
 ## Credits
 

@@ -25,5 +25,8 @@ bluetoothd*
 *-objc.txt
 *-symbols.txt
 
+# Python
+__pycache__/
+
 # macOS
 .DS_Store

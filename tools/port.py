@@ -31,7 +31,7 @@ CAVE_SRC = ROOT / "docs" / "cave.s"
 
 # Shared layout of the zero padding after __eh_frame (both kexts rely on it):
 #   __eh_frame + 0x060 .. + 0x180   BTLEAdvFix routine
-#   __eh_frame + 0x180 .. + 0x360   BTLERPAConnect routines
+#   __eh_frame + 0x180 .. + 0x400   BTLERPAConnect routines
 CAVE_OFFSET = 0x60
 CAVE_LIMIT = 0x180
 
@@ -57,7 +57,19 @@ CALLSITE = "66 43 89 04 6F 48 8B 85 ?? ?? ?? ?? 4C 8B BD ?? ?? ?? ?? 4C 39 F8 0F
 BRANCH = "48 8B 4A 08 EB 02 D1 E9 48 85 C9 0F 84 ?? ?? ?? ?? 48 8D B5 ?? ?? ?? ??"
 
 
-def port(binary):
+# Builds whose sharingd adds no NearbyAction while sending AirDrop. There the
+# alternation of docs/cave.s can hold the wrong order for a whole send, so
+# the AirDrop AD goes first, except while another session is boosted (see
+# AIRDROP_FIRST in docs/cave.s).
+AIRDROP_FIRST_BUILDS = {"25G72"}
+
+# Advertisement builder, minimum requested interval over the sessions:
+#   movq 0x30(%r12), %rcx; movzwl INTERVAL(%rcx), %r15d
+#   cmpw %r15w, %ax; cmovbl %eax, %r15d
+SESSION_INTERVAL = "49 8B 4C 24 ?? 44 0F B7 B9 ?? ?? ?? ?? 66 44 39 F8 44 0F 42 F8"
+
+
+def port(binary, os_build):
     notes = []
 
     site = binary.find_one("single advertising instance", SINGLE_ADV)
@@ -77,7 +89,12 @@ def port(binary):
     vec_end, vec_begin = binary.i32(call + 8), binary.i32(call + 15)
     if vec_end != vec_begin + 8:
         raise PortError("call site: the two loads are not the begin/end of one vector")
-    code, labels = assemble(CAVE_SRC, {"VEC_BEGIN": vec_begin, "VEC_END": vec_end}, "_cave")
+    symbols = {"VEC_BEGIN": vec_begin, "VEC_END": vec_end, "AIRDROP_FIRST": 0}
+    if os_build in AIRDROP_FIRST_BUILDS:
+        hit = binary.find_one("session interval", SESSION_INTERVAL)
+        symbols.update(AIRDROP_FIRST=1, INTERVAL=binary.i32(hit + 9))
+        notes.append(f"AirDrop first, yields to boosted sessions; session interval at +{symbols['INTERVAL']:#x}")
+    code, labels = assemble(CAVE_SRC, symbols, "_cave")
     if len(code) > CAVE_LIMIT - CAVE_OFFSET:
         raise PortError(f"routine is {len(code)} bytes, limit is {CAVE_LIMIT - CAVE_OFFSET}")
     if any(binary.bytes_at(cave, CAVE_LIMIT - CAVE_OFFSET)):
@@ -116,7 +133,7 @@ def main():
     path, os_build = args
     try:
         binary = Binary(path)
-        patches, notes = port(binary)
+        patches, notes = port(binary, os_build)
         for p in patches:
             print(f"{p.name:30s} 0x{binary.va(p.offset):x}  {len(p.original):3d} bytes")
         target = BUILDS / f"{os_build}.inc"

@@ -26,6 +26,27 @@
 #          target, and AirDrop to wake older iPhones.
 #      If AirDrop already is first in the "original order" phase it is
 #      swapped with the second session, so both ADs get airtime.
+#
+# The phase is chosen only when bluetoothd restarts advertising, which can be
+# minutes apart, so an AirDrop send can run entirely in phase 0. An iPhone on
+# iOS 15 then never sees the AirDrop AD and never wakes up.
+#
+# AIRDROP_FIRST (set per macOS build by tools/port.py): when 1, rules 1 and 2
+# are replaced by:
+#
+#   - the AirDrop AD goes first, as in 0.2.1, because on macOS 26.6 sharingd
+#     adds no NearbyAction while sending and the AirDrop AD is the only thing
+#     that wakes an older iPhone;
+#   - except while another session is boosted (interval 1..BOOST, 30 ms) and
+#     the AirDrop session is not: then that session goes first. sharingd
+#     boosts the connectable session for about 5 s when Apple Pay looks for
+#     the iPhone (NearbyInfo, ApplePayLegacy), for Handoff and when its data
+#     changes; each boost start and end restarts advertising, so the order is
+#     chosen again at both edges.
+#
+#   INTERVAL    offset of the session's requested advertising interval
+#               (uint16, 0.625 ms units; 0xde on 25G72), found by port.py
+    .set    BOOST, 0x30
     .text
     .globl _cave
 _cave:
@@ -38,6 +59,45 @@ _cave:
     movq    VEC_BEGIN(%rbp), %rcx
     movq    VEC_END(%rbp), %rdx
     movq    %rcx, %rsi
+.if AIRDROP_FIRST
+11: # find the AirDrop session; without one the order is kept
+    cmpq    %rdx, %rsi
+    jae     9f
+    movq    8(%rsi), %rdi
+    testq   %rdi, %rdi
+    je      12f
+    movq    0x38(%rdi), %r8
+    testq   %r8, %r8
+    je      12f
+    cmpq    $5, 0x10(%r8)
+    jb      12f
+    cmpl    $0x05004cff, 0x19(%r8)
+    je      13f
+12:
+    addq    $0x10, %rsi
+    jmp     11b
+13: # AirDrop at rsi. If it is boosted itself it goes first
+    movzwl  INTERVAL(%rdi), %eax
+    decl    %eax
+    cmpl    $BOOST - 1, %eax
+    jbe     8f
+    movq    %rcx, %r9
+14: # otherwise the first boosted session, if any, goes first
+    cmpq    %rdx, %r9
+    jae     8f
+    movq    8(%r9), %rdi
+    testq   %rdi, %rdi
+    je      15f
+    movzwl  INTERVAL(%rdi), %eax
+    decl    %eax
+    cmpl    $BOOST - 1, %eax
+    ja      15f
+    movq    %r9, %rsi
+    jmp     8f
+15:
+    addq    $0x10, %r9
+    jmp     14b
+.else
 1:  # pass 1: look for a NearbyAction TLV
     cmpq    %rdx, %rsi
     jae     5f
@@ -106,6 +166,7 @@ _cave:
 7:
     addq    $0x10, %rsi
     jmp     6b
+.endif
 8:  # swap element rsi with the first element (rcx)
     cmpq    %rcx, %rsi
     je      9f

@@ -129,6 +129,13 @@ The routine looks only at each session's raw advertising data, so it does not de
 1. **NearbyAction first.** A session whose Apple data carries a NearbyAction TLV (type `0F`, length >= 5) goes first. `sharingd` adds it while the Mac is looking for an AirDrop receiver. An iPhone on iOS 27.2 answers the Mac only when it sees this advertisement; with AirDrop always first (0.2.1) sending from the Mac to iOS 27.2 did not work on the tested machine.
 2. **Otherwise AirDrop and NearbyInfo take turns**, switching about every 2 seconds (bit 33 of the TSC): either the AirDrop session (`?? FF 4C 00 05`) is first, or the original order is kept, where the connectable session with AirPlay Target and NearbyInfo (`10`) comes first. iOS 27.2 needs NearbyInfo to recognise the Mac before it lists it as an AirDrop target; with AirDrop permanently in the slot the Mac was missing from the iPhone's AirDrop sheet.
 
+The turn is decided only when `bluetoothd` restarts advertising, which happens when a session changes and can be minutes apart; during a send it may not happen at all. That is fine where rule 1 covers sending, but on **macOS 26.6 (`25G72`)** `sharingd` adds no NearbyAction while sending AirDrop (only for NeedsKeyboard and, very briefly, NeedsCLink). There a whole send can fall into the NearbyInfo turn: an iPhone on iOS 15 never sees the AirDrop advertisement, never publishes its AirDrop service, and the send fails with "Bonjour discovery timed out". So the builds in `AIRDROP_FIRST_BUILDS` (`tools/port.py`, currently `25G72`) use a different rule:
+
+- **AirDrop first**, as in 0.2.1;
+- **except while another session is boosted**: when a session asks for a 30 ms interval (`0x30` or less) and the AirDrop session does not, that session goes first. `sharingd` boosts the connectable session for about 5 seconds when Apple Pay looks for the iPhone (NearbyInfo, `ApplePayLegacy`), for Handoff and when its data changes. Each boost start and end restarts advertising, so the order is chosen again at both edges. Without this, Apple Pay through the iPhone timed out whenever AirDrop was advertised, which on 26.6 is for minutes after AirDrop is opened.
+
+The interval is the session's requested advertising interval (`uint16` at `session + 0xde` on 25G72). `tools/port.py` finds the offset from the builder code that takes the minimum interval over all sessions. The other builds keep the order above.
+
 ### Safety properties
 
 - The kext contains no pattern search. It picks a table by the running macOS build (`kern.osversion`); on a build without a table nothing is patched.
@@ -291,17 +298,19 @@ clang++ -std=c++14 -I BTLEAdvFix tools/test_apply.cpp -o /tmp/test_apply
 /tmp/test_apply <clean bluetoothd> 25G332 /tmp/bluetoothd.patched
 ```
 
+`tools/test_order.py` runs the AirDrop-first routine (see [Advertising order](#advertising-order)) on fake session lists and checks the resulting order. It executes the assembled routine, so it needs an x86_64 Mac.
+
 ## Compatibility
 
 Verified on:
 
 | macOS | Build | Bluetooth | Receiver | Version |
 |-------|-------|-----------|----------|---------|
-| Tahoe 26.6 | `25G72` | Dell DW1560 / BCM20702A3 | iPhone 7 Plus, iOS 15.8.3 | 0.2.1 only, see below |
+| Tahoe 26.6 | `25G72` | Dell DW1560 / BCM20702A3 | iPhone 7 Plus, iOS 15.8.3 | 0.2.1; 0.3.2 (AirDrop); 0.3.3 pending, see below |
 | Tahoe 26.7.2 | `25G332` | Fenvi T919 / BCM20702A0 (USB `0b05:180a`, firmware v8718, no BrcmPatchRAM) | iPhone on iOS 27.2 | 0.3.0 |
 | Tahoe 26.7.3 | `25G342` | same machine | iPhone on iOS 27.2 | 0.3.0 |
 
-`25G72` has no table in 0.3.0 yet: generating it needs a clean copy of that build's `bluetoothd` (`python3 tools/port.py <bluetoothd> 25G72`). On a build without a table the kext loads and does nothing.
+The `25G72` table was added in 0.3.1. It was generated from a copy of that build's `bluetoothd` whose 2885 code pages all match the page hashes in Apple's code signature, and `tools/test_apply.cpp` applies all 4 patches together with BTLERPAConnect 0.3.1 in either order. The patch sites are the same as in 0.2.1. With the 0.3.0 order (0.3.1), sending from the Mac to the iOS 15.8.3 iPhone failed with "Bonjour discovery timed out"; since 0.3.2 this build uses the AirDrop-first order that 0.2.1 used on this machine, and 0.3.3 lets boosted sessions (Apple Pay, Handoff) through.
 
 Feature matrix on that machine, same on 26.7.2 and 26.7.3 (BTLEAdvFix 0.3.0 + BTLERPAConnect 0.3.0, OCLP-CustoMac 3.0.3 "Modern Wireless" for Wi-Fi/AWDL):
 
@@ -320,7 +329,7 @@ Other BCM20702-based cards (DW1830, BCM94352Z) are likely affected by the same i
 
 - **Instant Hotspot needs [BTLERPAConnect](https://github.com/trungkiengrxer/BTLERPAConnect).** BTLEAdvFix only makes the Mac advertise; the Bluetooth 4.0 limits that break LE connections opened by the Mac are handled there.
 - **One advertisement at a time.** The controller has a single 31-byte legacy advertising set. While the Mac looks for an AirDrop receiver the NearbyAction advertisement holds the slot; otherwise AirDrop and AirPlay/NearbyInfo/Handoff take turns about every 2 seconds, so discovery by other devices can take a few seconds longer than on a real Mac.
-- **The 0.3.0 order has not been tested with an iOS 15 receiver.** It was developed against iOS 27.2. If sending to an iOS 15 iPhone regresses compared to 0.2.1, please open an issue with an HCI trace.
+- **The order is chosen per macOS build, not per iPhone.** On `25G72` AirDrop is first except during boosts, which suits iOS 15; per the iOS 27.2 tests above this can hide the Mac from the AirDrop sheet of an iPhone on iOS 27.2 (not tested on 26.6). A long run of boosts (for example repeated Handoff updates) keeps AirDrop out of the slot for that time.
 - **Other Continuity features are not fixed.** Other Apple vendor commands are still rejected by the BCM20702, for example `BD_VSC_LE_META_*` with status `701`.
 
 ## Safety warning
@@ -333,6 +342,9 @@ Keep a working EFI backup, and keep a reliable way to disable the plugin: the `-
 
 ## Changelog
 
+- **0.3.3**: on macOS 26.6 (`25G72`) a session that asks for a 30 ms interval goes before AirDrop while it does, so Apple Pay through the iPhone and Handoff work while AirDrop is advertised (Apple Pay timed out with 0.3.2). New `tools/test_order.py`.
+- **0.3.2**: on macOS 26.6 (`25G72`) the AirDrop advertisement is always first again, as in 0.2.1: that build adds no NearbyAction while sending, and with the 0.3.0 order Mac -> iOS 15.8.3 failed. The order is chosen per build in `tools/port.py` (`AIRDROP_FIRST_BUILDS`); the 26.7.x tables are unchanged.
+- **0.3.1**: table for macOS 26.6 (25G72). The comment on the shared routine layout now reserves `__eh_frame + 0x180 .. 0x400` for BTLERPAConnect 0.3.1. Releases are built by GitHub Actions.
 - **0.3.0**: build-independent sources. Patch sites are found by signature with `tools/port.py`, which generates one table per macOS build (`BTLEAdvFix/builds/`); the kext picks the table by macOS build, checks the `LC_UUID` of `bluetoothd` and never patches an unknown build. New advertising order for iOS 27.2 (NearbyAction first, otherwise AirDrop and NearbyInfo take turns). Added macOS 26.7.2 (25G332) and 26.7.3 (25G342). `tools/check_patterns.py` is replaced by `tools/port.py --check`.
 - **0.2.1**: AirDrop-first routine (patches 2-4); AirDrop to iOS 15 now works reliably. `tools/check_patterns.py` checks branch targets; `tools/pklg_adv.py` decodes HCI traces.
 - **0.2.0** (not released): first AirDrop-first build. A branch into replaced bytes broke advertisement data.

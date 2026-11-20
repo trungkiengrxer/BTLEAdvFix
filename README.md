@@ -2,22 +2,30 @@
 
 Experimental Lilu plugin that restores Bluetooth LE advertising on Hackintoshes with non-Apple Broadcom Bluetooth controllers such as the BCM20702 in the Dell DW1560, under macOS Tahoe.
 
-It fixes two problems in `bluetoothd`, and both have to be fixed for **AirDrop from the Mac to older iPhones (iOS 15)** to work reliably:
+It fixes two problems in `bluetoothd`, and both have to be fixed for AirDrop between the Mac and an iPhone to work reliably:
 
 1. BLE advertising never starts at all.
-2. Once advertising works, the AirDrop advertisement is usually dropped in favour of other Continuity advertisements, because the controller has only one 31-byte advertising slot.
+2. Once advertising works, the controller has only one 31-byte advertising slot, and the advertisement the iPhone is waiting for is usually not the one in it.
+
+Since 0.3.0 the patches are no longer tied to one `bluetoothd` build: see [Porting to another macOS build](#porting-to-another-macos-build).
 
 ## Tested hardware and software
 
+Original development (0.1.0 - 0.2.1):
+
 - Dell Precision 5540 (SMBIOS `MacBookPro16,1`)
 - Dell DW1560 (Wi-Fi BCM4352, Bluetooth `BCM_20702A3`, USB `0489:E07A`)
-- macOS Tahoe 26.6 (build `25G72`)
-- Darwin 25.6.0
-- Intel x86_64 Hackintosh
-- Lilu 1.7.2
-- BrcmPatchRAM3 / BrcmFirmwareStore / BlueToolFixup 2.7.2
-- AirportBrcmFixup 2.2.0
+- macOS Tahoe 26.6 (build `25G72`), Darwin 25.6.0
+- Lilu 1.7.2, BrcmPatchRAM3 / BrcmFirmwareStore / BlueToolFixup 2.7.2, AirportBrcmFixup 2.2.0
 - Receiving device: iPhone 7 Plus (`iPhone9,2`), iOS 15.8.3
+
+0.3.0:
+
+- Gigabyte Z390 Aorus Pro WiFi, i5-9600KF (SMBIOS `MacPro7,1`), OpenCore 1.0.8
+- Fenvi T919 (Wi-Fi BCM4360, Bluetooth `BCM20702A0`, USB `0b05:180a`, ROM firmware v8718, **without** BrcmPatchRAM)
+- macOS Tahoe 26.7.2 (build `25G332`) and 26.7.3 (build `25G342`), Darwin 25.6.0
+- Lilu 1.7.2, BlueToolFixup 2.7.2, OCLP-CustoMac 3.0.3 root patches ("Modern Wireless")
+- iPhone on iOS 27.2, Apple Watch Series 4 on watchOS 10.6.2
 
 ## Problem
 
@@ -103,23 +111,30 @@ This is why AirDrop worked right after toggling Bluetooth or restarting `sharing
 
 ## How it works
 
-BTLEAdvFix is a Lilu plugin. It routes `_cs_validate_page`, and whenever a code page of `/usr/sbin/bluetoothd` is mapped, it applies four verified byte patches to that page.
+BTLEAdvFix is a Lilu plugin. It routes `_cs_validate_page`, and whenever a code page of `/usr/sbin/bluetoothd` is mapped, it applies the patches that lie on that page.
 
 | # | Location | Change |
 |---|----------|--------|
-| 1 | `0x100696a97` (LeBroadcaster constructor) | `jne` -> `nop nop`: always use a single advertising instance (fixes part 1) |
-| 2 | `0x100aa23b0` (zero padding after `__eh_frame`, end of `__TEXT`) | 116-byte routine that moves the AirDrop session to the front of the session vector ([`docs/cave.s`](docs/cave.s)) |
-| 3 | `0x1006a4351` (advertisement builder) | the two 7-byte loads of the session vector begin/end are replaced by `call 0x100aa23b0` + 9 `nop`; the routine performs both loads before returning |
-| 4 | `0x1006a3ce3` (advertisement builder) | `je 0x1006a4358` -> `je 0x1006a4351`. This branch jumped into the second replaced load. On that path `rax` already holds the vector end, so entering at the call is equivalent, and the routine runs there too |
+| 1 | LeBroadcaster constructor | `jne` -> `nop nop`: always use a single advertising instance (fixes part 1) |
+| 2 | zero padding after `__eh_frame`, end of `__TEXT` | routine that reorders the session vector ([`docs/cave.s`](docs/cave.s)) |
+| 3 | advertisement builder | the two 7-byte loads of the session vector begin/end are replaced by a `call` to the routine + 9 `nop`; the routine performs both loads before returning |
+| 4 | advertisement builder | the one `je` that jumped to the second replaced load is retargeted to the call. On that path `rax` already holds the vector end, so entering at the call is equivalent, and the routine runs there too |
 
-The routine identifies the AirDrop session by its raw data, `?? FF 4C 00 05` (an Apple manufacturer AD whose first type is AirDrop), so it does not depend on internal session flags. When no AirDrop advertisement is active, the order is unchanged and everything behaves exactly as with patch 1 alone.
+The addresses differ per macOS build and are listed in the generated tables in [`BTLEAdvFix/builds/`](BTLEAdvFix/builds).
 
-The result matches what a real Mac does with separate advertising sets: while AirDrop is active, the slot carries the AirDrop advertisement; otherwise it carries AirPlay, NearbyInfo and Handoff as before.
+### Advertising order
 
-Safety properties:
+The routine looks only at each session's raw advertising data, so it does not depend on internal session flags:
 
-- Every pattern occurs exactly once in `bluetoothd` 25G72. If a pattern is not found, nothing is patched.
-- There are no one-shot flags. Patches 2, 3 and 4 depend on each other, so every page-in of `bluetoothd` is patched again, and pages that are already patched no longer match.
+1. **NearbyAction first.** A session whose Apple data carries a NearbyAction TLV (type `0F`, length >= 5) goes first. `sharingd` adds it while the Mac is looking for an AirDrop receiver. An iPhone on iOS 27.2 answers the Mac only when it sees this advertisement; with AirDrop always first (0.2.1) sending from the Mac to iOS 27.2 did not work on the tested machine.
+2. **Otherwise AirDrop and NearbyInfo take turns**, switching about every 2 seconds (bit 33 of the TSC): either the AirDrop session (`?? FF 4C 00 05`) is first, or the original order is kept, where the connectable session with AirPlay Target and NearbyInfo (`10`) comes first. iOS 27.2 needs NearbyInfo to recognise the Mac before it lists it as an AirDrop target; with AirDrop permanently in the slot the Mac was missing from the iPhone's AirDrop sheet.
+
+### Safety properties
+
+- The kext contains no pattern search. It picks a table by the running macOS build (`kern.osversion`); on a build without a table nothing is patched.
+- When the Mach-O header page of `bluetoothd` is mapped, its `LC_UUID` is compared with the one the table was generated from. If it differs, patching stops until the next boot.
+- A patch is written only at its exact file offset and only over its exact original bytes.
+- There are no one-shot flags. Patches 2, 3 and 4 depend on each other, so every page-in of `bluetoothd` is patched again.
 - The System volume and `bluetoothd` on disk are not modified.
 - The plugin only loads on macOS Tahoe (Darwin 25).
 
@@ -220,23 +235,28 @@ sudo defaults delete /Library/Preferences/com.apple.MobileBluetooth.debug HCITra
 
 ## Porting to another macOS build
 
-The patches are tied to the exact bytes of `bluetoothd` in macOS 26.6 (25G72). After a macOS update, run:
+Nothing in the kext source is tied to a build. The build-specific bytes live in generated tables, one per macOS build, in `BTLEAdvFix/builds/`. To add a build, take a **clean** copy of its `/usr/sbin/bluetoothd` and run:
 
 ```bash
-python3 tools/check_patterns.py
+python3 tools/port.py /path/to/bluetoothd 25G332
 ```
 
-It checks that:
+then rebuild the kext. While the kext is active, reads of `/usr/sbin/bluetoothd` can return patched pages, so make the copy after booting with `-bladvoff` (or on a build the kext does not know, where it is inactive anyway).
 
-- every pattern matches exactly once;
-- the inserted call lands on the routine and the retargeted `je` lands on the call;
-- no branch anywhere in `__text` lands inside replaced bytes. That exact mistake broke an earlier 0.2.0 build: Apple data disappeared from every advertisement.
+`tools/port.py`:
 
-If it fails, new patterns are needed:
+- finds the three patch sites by signature. Bytes that change between builds (branch distances, stack offsets) are wildcards; the stack offsets of the session vector are read from the replaced instructions and passed to [`docs/cave.s`](docs/cave.s);
+- places the routine in the zero padding after `__eh_frame`, at `__eh_frame + 0x60` (`+0x180` and up belongs to BTLERPAConnect);
+- refuses to write anything unless every signature matches exactly once, the routine area is free, the retargeted `je` really pointed into the replaced instructions, and no other branch in `__text` lands inside replaced bytes. That last mistake broke an earlier 0.2.0 build: Apple data disappeared from every advertisement;
+- writes `builds/<build>.inc` with the slice offset, the `LC_UUID` and, for each patch, its file offset, original bytes and replacement bytes.
 
-1. `otool -arch x86_64 -tV /usr/sbin/bluetoothd > bluetoothd.asm`
+`python3 tools/port.py --check <bluetoothd> <build>` regenerates a table in memory and compares it with the committed one.
+
+If a signature no longer matches, the code changed and has to be looked at again:
+
+1. `otool -arch x86_64 -tV bluetoothd > bluetoothd.asm`
 2. Patch 1: find the string `Using a single advertising instance`. A few instructions above it is the `cmpb $0x0, 0xa0(%rax)` / `jne` pair to `nop` out.
-3. Patches 2-4: in the advertisement builder, find the two loops that walk the session vector (`movq -0x6db8(%rbp)` / `movq -0x6dc0(%rbp)` before a loop calling the raw-data size/data accessors). Re-derive the vector and session-data offsets, rebuild [`docs/cave.s`](docs/cave.s), and re-check every branch into the replaced instructions.
+3. Patches 2-4: in the advertisement builder, find the two loops that walk the session vector (two `movq ...(%rbp)` loads before a loop calling the raw-data size/data accessors). Update the signatures in `tools/port.py` and, if the vector or session layout changed, [`docs/cave.s`](docs/cave.s).
 
 ## Building
 
@@ -262,39 +282,58 @@ xcodebuild \
   build
 ```
 
-The kext and a release zip are written to `build/Release`. To rebuild the routine bytes:
+The kext and a release zip are written to `build/Release`.
+
+The code that patches a page has no kernel dependencies (`BTLEAdvFix/page_patcher.hpp`), so it can be run against a real binary before booting with it:
 
 ```bash
-clang -c -arch x86_64 docs/cave.s -o /tmp/cave.o && otool -t /tmp/cave.o
+clang++ -std=c++14 -I BTLEAdvFix tools/test_apply.cpp -o /tmp/test_apply
+/tmp/test_apply <clean bluetoothd> 25G332 /tmp/bluetoothd.patched
 ```
 
 ## Compatibility
 
-Currently verified only on:
+Verified on:
 
-- Dell DW1560 / BCM20702A3 Bluetooth
-- macOS Tahoe 26.6 (25G72)
-- Intel x86_64
-- AirDrop receiver: iPhone on iOS 15.8.3
+| macOS | Build | Bluetooth | Receiver | Version |
+|-------|-------|-----------|----------|---------|
+| Tahoe 26.6 | `25G72` | Dell DW1560 / BCM20702A3 | iPhone 7 Plus, iOS 15.8.3 | 0.2.1 only, see below |
+| Tahoe 26.7.2 | `25G332` | Fenvi T919 / BCM20702A0 (USB `0b05:180a`, firmware v8718, no BrcmPatchRAM) | iPhone on iOS 27.2 | 0.3.0 |
+| Tahoe 26.7.3 | `25G342` | same machine | iPhone on iOS 27.2 | 0.3.0 |
 
-Other BCM20702-based cards (DW1830, BCM94352Z, Fenvi with BCM20702) are likely affected by the same issues, but have not been tested. Cards with a native Apple Bluetooth module (for example BCM94360NG/CS2) do not need this plugin.
+`25G72` has no table in 0.3.0 yet: generating it needs a clean copy of that build's `bluetoothd` (`python3 tools/port.py <bluetoothd> 25G72`). On a build without a table the kext loads and does nothing.
+
+Feature matrix on that machine, same on 26.7.2 and 26.7.3 (BTLEAdvFix 0.3.0 + BTLERPAConnect 0.3.0, OCLP-CustoMac 3.0.3 "Modern Wireless" for Wi-Fi/AWDL):
+
+| Feature | Result |
+|---------|--------|
+| AirDrop Mac -> iPhone (iOS 27.2) | works |
+| AirDrop iPhone (iOS 27.2) -> Mac | works |
+| Handoff, AirPlay | work |
+| Instant Hotspot | works (needs BTLERPAConnect) |
+| Auto Unlock with Apple Watch | works (needs BTLERPAConnect) |
+| bluetoothd restarts | none |
+
+Other BCM20702-based cards (DW1830, BCM94352Z) are likely affected by the same issues, but have not been tested. Cards with a native Apple Bluetooth module (for example BCM94360NG/CS2) do not need this plugin.
 
 ## Known limitations
 
-- **Instant Hotspot still fails.** This is a different problem. The Mac must open a BLE connection to the iPhone. bluetoothd adds the iPhone's *identity* address (`Public 98:10:...`) to the controller's filter accept list and expects the controller to resolve the iPhone's random private address (RPA). That needs Bluetooth 4.2 LL Privacy, or the Broadcom `ADD_IRK_TO_LIST` vendor command that Apple's own firmware implements. The DW1560 firmware has neither (the vendor command returns `701`), so `LE_CreateConn` never matches the iPhone. The first attempt is also rejected with `0x0C Command Disallowed` because the controller is scanning. Connections initiated by the iPhone do work (bluetoothd resolves the RPA in software), but Instant Hotspot needs the Mac to connect. Workaround: turn on Personal Hotspot on the iPhone and join it from the Mac's Wi-Fi menu.
-- **One advertisement at a time.** While AirDrop is active, AirPlay/NearbyInfo/Handoff advertisements are paused. This is a hardware limit of a single legacy advertising set.
+- **Instant Hotspot needs [BTLERPAConnect](https://github.com/trungkiengrxer/BTLERPAConnect).** BTLEAdvFix only makes the Mac advertise; the Bluetooth 4.0 limits that break LE connections opened by the Mac are handled there.
+- **One advertisement at a time.** The controller has a single 31-byte legacy advertising set. While the Mac looks for an AirDrop receiver the NearbyAction advertisement holds the slot; otherwise AirDrop and AirPlay/NearbyInfo/Handoff take turns about every 2 seconds, so discovery by other devices can take a few seconds longer than on a real Mac.
+- **The 0.3.0 order has not been tested with an iOS 15 receiver.** It was developed against iOS 27.2. If sending to an iOS 15 iPhone regresses compared to 0.2.1, please open an issue with an HCI trace.
 - **Other Continuity features are not fixed.** Other Apple vendor commands are still rejected by the BCM20702, for example `BD_VSC_LE_META_*` with status `701`.
 
 ## Safety warning
 
 This project patches executable code of a system daemon at runtime, including inserting a small routine.
 
-A mismatched macOS build is ignored by design: patterns simply do not match. Even so, any patch to `bluetoothd` can cause Bluetooth instability.
+An unsupported macOS build is ignored by design: the kext has no table for it and does not search for patterns at runtime. Even so, any patch to `bluetoothd` can cause Bluetooth instability.
 
 Keep a working EFI backup, and keep a reliable way to disable the plugin: the `-bladvoff` boot argument, removing the kext, or going back to 0.1.0.
 
 ## Changelog
 
+- **0.3.0**: build-independent sources. Patch sites are found by signature with `tools/port.py`, which generates one table per macOS build (`BTLEAdvFix/builds/`); the kext picks the table by macOS build, checks the `LC_UUID` of `bluetoothd` and never patches an unknown build. New advertising order for iOS 27.2 (NearbyAction first, otherwise AirDrop and NearbyInfo take turns). Added macOS 26.7.2 (25G332) and 26.7.3 (25G342). `tools/check_patterns.py` is replaced by `tools/port.py --check`.
 - **0.2.1**: AirDrop-first routine (patches 2-4); AirDrop to iOS 15 now works reliably. `tools/check_patterns.py` checks branch targets; `tools/pklg_adv.py` decodes HCI traces.
 - **0.2.0** (not released): first AirDrop-first build. A branch into replaced bytes broke advertisement data.
 - **0.1.0**: single advertising instance (patch 1). BLE advertising works, but AirDrop to iOS 15 works only intermittently.
@@ -302,6 +341,8 @@ Keep a working EFI backup, and keep a reliable way to disable the plugin: the `-
 ## Credits
 
 - Acidanthera for Lilu, MacKernelSDK, BrcmPatchRAM and BlueToolFixup
+- Bosca27 for the port to macOS 26.7.2, the iOS 27.2 investigation (logs and HCI traces from Mac and iPhone) and all testing on the Fenvi T919; the 0.3.0 analysis, routine and tooling were written with Claude Code (Anthropic)
+- KGP / Klaus (OCLP-CustoMac) for the request to make the patching independent of the macOS build
 - FeatureUnlock and RealtekUVCFix as reference implementations for runtime page patching
 - Everyone who reported and investigated the one-way AirDrop issue in [acidanthera/bugtracker#1821](https://github.com/acidanthera/bugtracker/issues/1821)
 

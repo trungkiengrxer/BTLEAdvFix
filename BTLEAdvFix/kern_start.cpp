@@ -2,36 +2,21 @@
 //  kern_start.cpp
 //  BTLEAdvFix.kext
 //
-//  Runtime patches for /usr/sbin/bluetoothd (macOS Tahoe 26.6, 25G72, x86_64)
-//  on non-Apple Broadcom BCM20702 controllers (e.g. DW1560).
+//  Runtime patches for /usr/sbin/bluetoothd (macOS Tahoe, x86_64) on
+//  non-Apple Broadcom BCM20702 controllers (e.g. DW1560, Fenvi T919).
 //
-//  1. Single advertising instance
-//     bluetoothd selects "multiple advertising" mode, sends a Broadcom vendor
-//     command the BCM20702 rejects (STATUS 701), and LeBroadcaster never sets
-//     its stack-started flag, so no BLE advertisement is ever sent.
-//     NOP the jne in the LeBroadcaster constructor so the
-//     "Using a single advertising instance" branch always runs.
+//  What is patched and why is described in README.md, docs/cave.s and
+//  tools/port.py. This file holds no build-specific bytes: it only applies
+//  the tables in builds/<macOS build>.inc, which tools/port.py generates
+//  from a clean bluetoothd by signature search.
 //
-//       0x100696a90  cmpb $0x0, 0xa0(%rax)   ; SupportsMultipleAdvertising
-//       0x100696a97  jne  0x100696ae3        ; -> nop nop
-//
-//  2. AirDrop first in the single instance
-//     With one 31-byte instance, LeBroadcaster copies each session's raw
-//     advertising data first-fit, in session-vector order. The AirDrop AD
-//     (24 bytes) and the connectable AirPlay/NearbyInfo AD (21 bytes) never
-//     fit together, so whichever session comes first wins and AirDrop is
-//     dropped most of the time (iOS 15 then never wakes up).
-//     Before the copy loops, call a small routine placed in the zero padding
-//     after __eh_frame that moves the session whose data starts with
-//     "?? FF 4C 00 05" (Apple AirDrop) to the front of the vector.
-//
-//       0x1006a4351  mov rax,[rbp-0x6db8]; mov r15,[rbp-0x6dc0]
-//                    -> call 0x100aa23b0; nop x9   (routine re-does both loads)
-//       0x100aa23b0  routine (116 bytes, see docs/cave.s)
-//       0x1006a3ce3  je 0x1006a4358 -> je 0x1006a4351
-//                    (this branch jumped into the second replaced load; on that
-//                    path rax already holds [rbp-0x6db8], so entering at the
-//                    call is equivalent and also runs the routine)
+//  Safety rules:
+//    * The table is chosen by the running macOS build (kern.osversion).
+//      An unknown build is never patched, there is no pattern search here.
+//    * The LC_UUID in the Mach-O header page of bluetoothd must be the one
+//      the table was generated from, otherwise patching stops for good.
+//    * A patch is written only at its exact file offset and only over the
+//      exact original bytes.
 //
 
 #include <Headers/plugin_start.hpp>
@@ -42,109 +27,38 @@
 
 #define MODULE_SHORT "bladv"
 
+#include "page_patcher.hpp"
+#include "builds/all.inc"
+
 static const char bluetoothdPath[] = "/usr/sbin/bluetoothd";
 
 static mach_vm_address_t originalCsValidatePage {};
 
-struct BluetoothdPatch {
-    const uint8_t *original;
-    const uint8_t *replacement;
-    size_t size;
-    const char *name;
-};
+// kern.osversion. launchd fills it in early in boot, long before bluetoothd
+// starts, so it is read when the first bluetoothd page arrives.
+static const char *kernelOsVersion {};
 
-// ponytail: exact patterns for 25G72 only; add a set here when another build differs.
-static const uint8_t singleAdvOriginal[] {
-    0x80, 0xB8, 0xA0, 0x00, 0x00, 0x00, 0x00,   // cmpb $0x0, 0xa0(%rax)
-    0x75, 0x4A,                                 // jne  +0x4a
-    0x48, 0x8D, 0x05                            // leaq ...(%rip), %rax
-};
+static const BluetoothdBuild *currentBuild {};
+static bool buildResolved {};
+static bool binaryRejected {};
 
-static const uint8_t singleAdvReplacement[] {
-    0x80, 0xB8, 0xA0, 0x00, 0x00, 0x00, 0x00,
-    0x90, 0x90,
-    0x48, 0x8D, 0x05
-};
+static const BluetoothdBuild *resolveBuild() {
+    if (buildResolved)
+        return currentBuild;
 
-// 0x1006a434c..0x1006a4368
-static const uint8_t airdropCallsiteOriginal[] {
-    0x66, 0x43, 0x89, 0x04, 0x6F, 0x48, 0x8B, 0x85, 0x48, 0x92, 0xFF, 0xFF,
-    0x4C, 0x8B, 0xBD, 0x40, 0x92, 0xFF, 0xFF, 0x4C, 0x39, 0xF8, 0x0F, 0x84,
-    0xA0, 0x00, 0x00, 0x00
-};
+    if (kernelOsVersion == nullptr || kernelOsVersion[0] == '\0')
+        return nullptr;
 
-static const uint8_t airdropCallsiteReplacement[] {
-    0x66, 0x43, 0x89, 0x04, 0x6F, 0xE8, 0x5A, 0xE0, 0x3F, 0x00, 0x90, 0x90,
-    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x4C, 0x39, 0xF8, 0x0F, 0x84,
-    0xA0, 0x00, 0x00, 0x00
-};
+    currentBuild = bluetoothdFindBuild(bluetoothdBuilds, arrsize(bluetoothdBuilds), kernelOsVersion);
+    buildResolved = true;
 
-// 0x1006a3cd8..0x1006a3cf0: retarget je from 0x1006a4358 to 0x1006a4351
-static const uint8_t airdropBranchOriginal[] {
-    0x48, 0x8B, 0x4A, 0x08, 0xEB, 0x02, 0xD1, 0xE9, 0x48, 0x85, 0xC9, 0x0F,
-    0x84, 0x6F, 0x06, 0x00, 0x00, 0x48, 0x8D, 0xB5, 0x7E, 0x92, 0xFF, 0xFF
-};
+    if (currentBuild)
+        SYSLOG(MODULE_SHORT, "macOS build %s is supported", kernelOsVersion);
+    else
+        SYSLOG(MODULE_SHORT, "macOS build %s is not supported, bluetoothd is left untouched (see tools/port.py)", kernelOsVersion);
 
-static const uint8_t airdropBranchReplacement[] {
-    0x48, 0x8B, 0x4A, 0x08, 0xEB, 0x02, 0xD1, 0xE9, 0x48, 0x85, 0xC9, 0x0F,
-    0x84, 0x68, 0x06, 0x00, 0x00, 0x48, 0x8D, 0xB5, 0x7E, 0x92, 0xFF, 0xFF
-};
-
-// 0x100aa2350..0x100aa2424: __eh_frame (kept) + zero padding (routine goes at 0x100aa23b0)
-static const uint8_t airdropCaveOriginal[] {
-    0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7A, 0x52, 0x00,
-    0x01, 0x78, 0x10, 0x01, 0x10, 0x0C, 0x07, 0x08, 0x90, 0x01, 0x00, 0x00,
-    0x1C, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x30, 0x6E, 0x5F, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00,
-    0x3C, 0x00, 0x00, 0x00, 0x30, 0x6E, 0x5F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
-static const uint8_t airdropCaveReplacement[] {
-    0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x7A, 0x52, 0x00,
-    0x01, 0x78, 0x10, 0x01, 0x10, 0x0C, 0x07, 0x08, 0x90, 0x01, 0x00, 0x00,
-    0x1C, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x30, 0x6E, 0x5F, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x00,
-    0x3C, 0x00, 0x00, 0x00, 0x30, 0x6E, 0x5F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // 0x100aa23b0: move the AirDrop session to the front of the vector
-    0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x48, 0x8B, 0x8D, 0x40, 0x92, 0xFF,
-    0xFF, 0x48, 0x8B, 0x95, 0x48, 0x92, 0xFF, 0xFF, 0x48, 0x89, 0xCE, 0x48,
-    0x39, 0xD6, 0x73, 0x43, 0x48, 0x8B, 0x7E, 0x08, 0x48, 0x85, 0xFF, 0x74,
-    0x1A, 0x4C, 0x8B, 0x47, 0x38, 0x4D, 0x85, 0xC0, 0x74, 0x11, 0x49, 0x83,
-    0x78, 0x10, 0x05, 0x72, 0x0A, 0x41, 0x81, 0x78, 0x19, 0xFF, 0x4C, 0x00,
-    0x05, 0x74, 0x06, 0x48, 0x83, 0xC6, 0x10, 0xEB, 0xD2, 0x48, 0x39, 0xCE,
-    0x74, 0x15, 0x48, 0x8B, 0x39, 0x48, 0x87, 0x3E, 0x48, 0x89, 0x39, 0x48,
-    0x8B, 0x79, 0x08, 0x48, 0x87, 0x7E, 0x08, 0x48, 0x89, 0x79, 0x08, 0x41,
-    0x58, 0x5F, 0x5E, 0x5A, 0x59, 0x48, 0x8B, 0x85, 0x48, 0x92, 0xFF, 0xFF,
-    0x4C, 0x8B, 0xBD, 0x40, 0x92, 0xFF, 0xFF, 0xC3
-};
-
-static_assert(sizeof(singleAdvOriginal) == sizeof(singleAdvReplacement), "size");
-static_assert(sizeof(airdropCallsiteOriginal) == sizeof(airdropCallsiteReplacement), "size");
-static_assert(sizeof(airdropCaveOriginal) == sizeof(airdropCaveReplacement), "size");
-static_assert(sizeof(airdropBranchOriginal) == sizeof(airdropBranchReplacement), "size");
-
-static const BluetoothdPatch patches[] {
-    { singleAdvOriginal, singleAdvReplacement, sizeof(singleAdvOriginal), "single advertising instance" },
-    { airdropCaveOriginal, airdropCaveReplacement, sizeof(airdropCaveOriginal), "AirDrop-first routine" },
-    { airdropCallsiteOriginal, airdropCallsiteReplacement, sizeof(airdropCallsiteOriginal), "AirDrop-first call" },
-    { airdropBranchOriginal, airdropBranchReplacement, sizeof(airdropBranchOriginal), "AirDrop-first branch" },
-};
+    return currentBuild;
+}
 
 static void patchedCsValidatePage(
     vnode_t vnode,
@@ -160,7 +74,7 @@ static void patchedCsValidatePage(
         originalCsValidatePage
     )(vnode, pager, pageOffset, data, validated, tainted, nx);
 
-    if (data == nullptr)
+    if (data == nullptr || binaryRejected)
         return;
 
     char path[PATH_MAX] {};
@@ -172,35 +86,44 @@ static void patchedCsValidatePage(
     if (strcmp(path, bluetoothdPath) != 0)
         return;
 
-    // No one-shot flags: the call site and the routine depend on each other,
-    // so every page-in of bluetoothd must be patched again. Already patched
-    // pages no longer match the original bytes.
-    for (size_t i = 0; i < arrsize(patches); i++) {
-        const auto &patch = patches[i];
+    auto build = resolveBuild();
 
-        if (KernelPatcher::findAndReplace(
-            const_cast<void *>(data),
-            PAGE_SIZE,
-            patch.original,
-            patch.size,
-            patch.replacement,
-            patch.size
-        )) {
-            SYSLOG(
-                MODULE_SHORT,
-                "applied %s in %s at page offset 0x%llx",
-                patch.name,
-                path,
-                static_cast<unsigned long long>(pageOffset)
-            );
-        }
+    if (build == nullptr)
+        return;
+
+    auto page = static_cast<uint8_t *>(const_cast<void *>(data));
+
+    // The header page is the first one dyld touches. A different LC_UUID
+    // means this is not the binary the table was made from.
+    if (!bluetoothdIsExpectedBinary(*build, pageOffset, page)) {
+        binaryRejected = true;
+        SYSLOG(MODULE_SHORT, "bluetoothd is not the one shipped with %s, it is left untouched", build->osBuild);
+        return;
     }
+
+    // Patch on every page-in: the page cache can drop and reload a page.
+    // Routines and call sites sit on different pages; each page is patched
+    // when it faults in, before any code on it runs.
+    bluetoothdPatchPage(*build, pageOffset, page, [](const BluetoothdPatch &patch, bool applied) {
+        if (applied)
+            DBGLOG(MODULE_SHORT, "applied %s at slice offset 0x%x", patch.name, patch.offset);
+        else
+            SYSLOG(MODULE_SHORT, "unexpected bytes for %s at slice offset 0x%x, not patched", patch.name, patch.offset);
+    });
 }
 
 static void pluginStart() {
     DBGLOG(MODULE_SHORT, "BTLEAdvFix starting");
 
     lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+        kernelOsVersion = reinterpret_cast<const char *>(patcher.solveSymbol(KernelPatcher::KernelID, "_osversion"));
+
+        if (kernelOsVersion == nullptr) {
+            patcher.clearError();
+            SYSLOG(MODULE_SHORT, "failed to find kern.osversion, bluetoothd is left untouched");
+            return;
+        }
+
         KernelPatcher::RouteRequest request(
             "_cs_validate_page",
             patchedCsValidatePage,
